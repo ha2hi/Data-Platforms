@@ -24,6 +24,8 @@ class Api:
         try:
             resp = PublicApi.price(markets)
 
-            return resp
+            krw_price = resp[0]
+            
+            return krw_price
         except Exception:
             return resp
