@@ -1,14 +1,42 @@
-# print -> logging 변경 필요
-from client import Api
+from __future__ import annotations
+
 from kafka import KafkaProducer
 from json import dumps
+import json
 from kafka.errors import KafkaError
-
+import functools
+import time
+import os
 
 BROKER_LIST = ["15.164.218.105:9091", "15.164.218.105:9092", "15.164.218.105:9093"]
-TOPIC_NAME = "transction"
+TOPIC = "transction"
 
-class DataGenerator:
+def retry_with_backoff(max_retries: int = 5,
+                       initial_backoff: float = 1.0,
+                       max_backoff: float = 30.0):
+    """
+    예외 발생 시 지수적 백오프를 사용하여 함수를 다시 시도하는 데코레이터입니다.
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            retries = 0
+            backoff = initial_backoff
+            while True:
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    retries += 1
+                    if retries > max_retries:
+                        print(f"{func.__name__} failed after {retries} attempts: {e}")
+                        raise
+                    print(f"{func.__name__} error: {e}, retry {retries}/{max_retries} in {backoff}s")
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, max_backoff)
+        return wrapper
+    return decorator
+        
+class KafkaDataProducerService:
     """
     Description:
         API Data to Kafka
@@ -17,36 +45,56 @@ class DataGenerator:
         - brokers (List[str], Required) : Broker 목록
         - retries (Optional[int]) : 재시도 횟수
     """
-    def __init__(self, topic_name, brokers, retries = 3):
-        self.topic_name = topic_name
+    def __init__(self, topic, brokers, retries = 3):
+        self.topic = topic
         self.brokers = brokers
         self.retries = retries
-
-    def publish_prices(self):
-        producer = KafkaProducer(
-            acks=0,
-            bootstrap_servers=self.brokers,
-            retries = self.retries,
-            value_serializer=lambda x: dumps(x).encode('utf-8')
-        )
-        try:
-            tickers = Api.get_tickers()
-            if tickers is None:
-                raise Exception("Ticker 조회가 안되었습니다.")
-            
-            for ticker in tickers:
-                data = Api.get_price(ticker)
-                producer.send(self.topic_name, data)
-                print(data)
-
-            producer.flush()
         
-        except KafkaError as e:
-            print(f"Kafka error occurred: {e}")
-        finally:
-            producer.close() # kafka-python는 __enter__() / __exit__() 메서드를 구현하고 있지 않기 때문에 with 문을 사용할 수 없습니다. 따라서 close 선언 필요
+        self.producer = self._create_producer()
 
+    @retry_with_backoff(max_retries = int(os.getenv("RETRY_MAX", 6)), 
+                        initial_backoff = float(os.getenv("RETRY_INITIAL_BACKOFF", 1.0)), 
+                        max_backoff = float(os.getenv("RETRY_MAX_BACKOFF", 30.0)))
+    def _create_producer(self) -> KafkaProducer:
+        return KafkaProducer(
+            bootstrap_servers = self.brokers,
+            retries = self.retries,
+            value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+            request_timeout_ms=30000
+        )
+
+    def publish(self, messages):
+        for messgae in messages:
+            try:
+                future = self.producer.send(self.topic, messgae)
+                metadata = future.get(timeout=10)
+                print(f"Publish to {self.topic} partition = {metadata.partition} offset = {metadata.offset}")
+            except KafkaError as e:
+                print(f"Kafka publish error : {e}")
+        try:
+            self.producer.flush()
+        except KafkaError as e:
+            print(f"Error flushing producer: {e}")
+
+    def close(self):
+        try:
+            self.producer.close()
+            print("Kafka producer closed successfully.")
+        except Exception as e:
+            print(f"Error closing producer: {e}")
 
 if __name__ == "__main__":
-    generator = DataGenerator(TOPIC_NAME, BROKER_LIST)
-    generator.publish_prices()
+    from client import Api
+    
+    service = KafkaDataProducerService(TOPIC, BROKER_LIST)
+    try:
+        tickers = Api.get_tickers()
+        if not tickers:
+            print("No tickers retrived; aborting")
+        else:
+            messages = [Api.get_price(t) for t in tickers]
+            service.publish(messages)
+    except Exception as e:
+        print(f"Unexpected error in data publishing workflow: {e}")
+    finally:
+        service.close()
