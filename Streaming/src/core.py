@@ -4,6 +4,8 @@ from requests.adapters import HTTPAdapter
 import requests
 from urllib3.util.retry import Retry
 
+__all__ = ["PublicApi"]
+
 class PublicApi:
     @staticmethod
     def ticker(is_deatils = False):
